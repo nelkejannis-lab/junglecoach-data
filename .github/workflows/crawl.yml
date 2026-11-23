@@ -1,0 +1,33 @@
+# Sammelt rund um die Uhr Ranked-Games (alle 6 Std. ein Lauf von ~5,5 Std.)
+# und veröffentlicht die Datenbank als Release "meta-latest" für die Jungle-Coach-App.
+name: Crawl meta
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+permissions:
+  contents: write
+concurrency:
+  group: crawl
+  cancel-in-progress: false
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Load previous database
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          gh release download meta-latest -p meta.sqlite.gz -R ${{ github.repository }} && gunzip -f meta.sqlite.gz || echo "first run"
+      - name: Crawl
+        env: { RIOT_API_KEY: "${{ secrets.RIOT_API_KEY }}" }
+        run: python crawl.py --minutes ${{ github.event_name == 'workflow_dispatch' && '30' || '320' }}
+      - name: Publish
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          gh release view meta-latest -R ${{ github.repository }} >/dev/null 2>&1 || \
+            gh release create meta-latest -R ${{ github.repository }} --title "Meta-Datenbank" --notes "Wird automatisch aktualisiert."
+          gh release upload meta-latest meta.sqlite.gz --clobber -R ${{ github.repository }}
