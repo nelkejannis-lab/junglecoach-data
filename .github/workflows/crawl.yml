@@ -1,10 +1,13 @@
-# Sammelt rund um die Uhr Ranked-Games (alle 6 Std. ein Lauf von ~5,5 Std.)
+# Sammelt rund um die Uhr Ranked-Games: stündlich angestoßen, die Läufe warten aufeinander
+# (concurrency), sodass immer genau einer läuft – ein Lauf dauert ~5,5 Std., dann startet sofort der nächste.
 # und veröffentlicht die Datenbank als Release "meta-latest" für die Jungle-Coach-App.
 name: Crawl meta
 on:
   workflow_dispatch:
+    inputs:
+      minutes: { description: "Laufzeit in Minuten", default: "320" }
   schedule:
-    - cron: "17 */6 * * *"
+    - cron: "17 * * * *"
 permissions:
   contents: write
 concurrency:
@@ -13,7 +16,7 @@ concurrency:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,7 +27,7 @@ jobs:
           gh release download meta-latest -p meta.sqlite.gz -R ${{ github.repository }} && gunzip -f meta.sqlite.gz || echo "first run"
       - name: Crawl
         env: { RIOT_API_KEY: "${{ secrets.RIOT_API_KEY }}" }
-        run: python crawl.py --minutes ${{ github.event_name == 'workflow_dispatch' && '30' || '320' }}
+        run: python crawl.py --minutes ${{ inputs.minutes || '320' }}
       - name: Publish
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |

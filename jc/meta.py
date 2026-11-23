@@ -39,6 +39,9 @@ def connect(path=None):
                   role TEXT, PRIMARY KEY(match_id, champ))"""
     db.execute(schema.format(t="games"))
     db.execute("CREATE TABLE IF NOT EXISTS seen(match_id TEXT PRIMARY KEY)")
+    # players found on a focus champion (e.g. Gwen / Graves mains): every crawl starts with them
+    db.execute("""CREATE TABLE IF NOT EXISTS focus_players(puuid TEXT, region TEXT, tier TEXT, champ TEXT,
+                  last_seen INT, PRIMARY KEY(puuid, region))""")
     cols = [r[1] for r in db.execute("PRAGMA table_info(games)")]
     pk = [r[1] for r in sorted(db.execute("PRAGMA table_info(games)"), key=lambda r: r[5]) if r[5]]
     if pk != ["match_id", "champ"] or "role" not in cols:  # migrate older databases
@@ -149,14 +152,21 @@ class Crawler:
         db.execute("PRAGMA busy_timeout=30000")
         try:
             api = RiotAPI(self.cfg["riot_api_key"], self.cfg.get("platform", "euw1"))
+            region = self.cfg.get("platform", "euw1")
+            focus = set(self.cfg.get("meta_focus") or self.cfg.get("champion_pool") or [])
+            known = []
+            if focus:  # known mains first (most recently seen), then the even elo sample
+                known = [(p, t, True) for p, t in db.execute(
+                    "SELECT puuid, tier FROM focus_players WHERE region=? ORDER BY last_seen DESC LIMIT ?",
+                    (region, int(self.cfg.get("meta_focus_players", 400))))]
+                random.shuffle(known)
             players = self._players(api)
             target = int(self.cfg.get("meta_max_matches", 1500))
             seen = {r[0] for r in db.execute("SELECT match_id FROM seen")}
-            focus = set(self.cfg.get("meta_focus") or self.cfg.get("champion_pool") or [])
-            queue = list(players)
+            queue = known + [(p, t, False) for p, t in players]
             done = set()
             while queue:
-                puuid, tier = queue.pop(0)
+                puuid, tier, is_focus = queue.pop(0)
                 if puuid in done:
                     continue
                 done.add(puuid)
@@ -166,7 +176,8 @@ class Crawler:
                     break
                 st["players"] += 1
                 ids = api.get(f"/lol/match/v5/matches/by-puuid/{puuid}/ids",
-                              {"queue": 420, "count": int(self.cfg.get("meta_matches_per_player", 5)),
+                              {"queue": 420, "count": int(self.cfg.get("meta_focus_matches", 25)) if is_focus
+                               else int(self.cfg.get("meta_matches_per_player", 5)),
                                "startTime": int(time.time()) - 10 * 86400})  # only recent games (current patch)
                 for mid in ids:
                     if self._stop or st["matches"] >= target or (self.deadline and time.time() > self.deadline):
@@ -179,9 +190,13 @@ class Crawler:
                         st["matches"] += 1
                         if focus and any(p["championName"] in focus for p in m["info"]["participants"]):  # snowball: players on a focus champion probably play it again
                             for p in m["info"]["participants"]:
-                                if p["championName"] in focus and p["puuid"] not in done:
-                                    queue.insert(0, (p["puuid"], tier))
+                                if p["championName"] in focus:
+                                    db.execute("INSERT OR REPLACE INTO focus_players VALUES (?,?,?,?,?)",
+                                               (p["puuid"], region, tier, p["championName"], int(time.time())))
+                                    if p["puuid"] not in done:
+                                        queue.insert(0, (p["puuid"], tier, True))
                     st["message"] = f"{st['matches']}/{target} Games gesammelt"
+            db.commit()
             st["message"] = f"fertig – {st['matches']} neue Games"
         except Exception as e:
             st["message"] = f"Fehler: {e}"
