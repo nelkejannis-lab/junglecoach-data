@@ -1,0 +1,43 @@
+name: Website meta
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '43 */6 * * *'
+  push:
+    branches: [main]
+    paths: ['website/**', '.github/workflows/website-meta.yml']
+permissions:
+  contents: write
+concurrency:
+  group: website-meta
+  cancel-in-progress: false
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install
+        working-directory: website
+      - run: npx playwright install --with-deps chromium
+        working-directory: website
+      - name: Collect fresh pages
+        working-directory: website
+        run: |
+          node scraper.mjs --champions gwen,graves --out output || test "$?" = 2
+          test -s output/website-meta.json
+      - name: Publish current snapshot including source failures
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view website-latest >/dev/null 2>&1 || gh release create website-latest --title "Website-Meta" --notes "Fresh website snapshots; patch aggregates, not today's matches only."
+          gh release upload website-latest website/output/website-meta.json --clobber
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: website-meta
+          path: website/output/
+          retention-days: 7
