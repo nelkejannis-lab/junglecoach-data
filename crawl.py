@@ -12,7 +12,7 @@ from jc import meta
 ap = argparse.ArgumentParser()
 ap.add_argument("--minutes", type=float, default=330)
 ap.add_argument("--db", default="meta.sqlite")
-ap.add_argument("--regions", default="euw1,na1,kr")
+ap.add_argument("--regions", default="euw1,na1,kr,oc1")  # one per Riot routing region = 4x the rate limit
 a = ap.parse_args()
 
 key = os.environ["RIOT_API_KEY"].strip()

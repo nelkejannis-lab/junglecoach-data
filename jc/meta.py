@@ -166,7 +166,8 @@ class Crawler:
                     break
                 st["players"] += 1
                 ids = api.get(f"/lol/match/v5/matches/by-puuid/{puuid}/ids",
-                              {"queue": 420, "count": int(self.cfg.get("meta_matches_per_player", 5))})
+                              {"queue": 420, "count": int(self.cfg.get("meta_matches_per_player", 5)),
+                               "startTime": int(time.time()) - 10 * 86400})  # only recent games (current patch)
                 for mid in ids:
                     if self._stop or st["matches"] >= target or (self.deadline and time.time() > self.deadline):
                         break
@@ -189,9 +190,14 @@ class Crawler:
             db.close()
 
 
-def prune(db, keep_patches=2, max_rows=1_000_000):
-    """Keep the database small: only the newest patches and at most max_rows games."""
+def prune(db, keep_patches=2, max_rows=1_000_000, enough_current=150_000):
+    """Keep only current data: the newest patch, plus the previous one while the new patch
+    has fewer than enough_current rows (start of a patch). At most max_rows rows."""
     patches = [r[0] for r in db.execute("SELECT patch FROM games GROUP BY patch ORDER BY MAX(created) DESC")]
+    if patches:
+        cur = db.execute("SELECT COUNT(*) FROM games WHERE patch=?", (patches[0],)).fetchone()[0]
+        if cur >= enough_current:
+            keep_patches = 1
     for old in patches[keep_patches:]:
         db.execute("DELETE FROM games WHERE patch=?", (old,))
     db.execute("""DELETE FROM games WHERE rowid IN (SELECT rowid FROM games ORDER BY created DESC LIMIT -1 OFFSET ?)""",
