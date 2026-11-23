@@ -56,6 +56,7 @@ meta.prune(db, keep_patches=2, max_rows=400_000)
 db.execute("DELETE FROM seen WHERE match_id NOT IN (SELECT match_id FROM games)")
 db.commit()
 db.execute("VACUUM")
+db.execute("PRAGMA journal_mode=DELETE")  # single self-contained file for the app download
 after = db.execute("SELECT COUNT(*) FROM games").fetchone()[0]
 db.close()
 with open(a.db, "rb") as src, gzip.open(a.db + ".gz", "wb", compresslevel=9) as dst:

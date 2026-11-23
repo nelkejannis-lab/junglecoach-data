@@ -33,7 +33,11 @@ def bracket_of(tier):
 
 
 def connect(path=None):
-    db = sqlite3.connect(path or DB_PATH, check_same_thread=False, timeout=30)
+    db = sqlite3.connect(path or DB_PATH, check_same_thread=False, timeout=60)
+    try:  # WAL: several crawler threads can write while others read
+        db.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass
     schema = """CREATE TABLE IF NOT EXISTS {t}(match_id TEXT, champ TEXT, team INT, win INT,
                   items TEXT, keystone INT, enemy TEXT, patch TEXT, created INT, tier TEXT, perks TEXT, enemies TEXT,
                   role TEXT, PRIMARY KEY(match_id, champ))"""
@@ -81,6 +85,7 @@ def store_match(db, match, tier=None, focus=None, all_players=True):
     mid = match["metadata"]["matchId"]
     db.execute("INSERT OR IGNORE INTO seen VALUES (?)", (mid,))
     if info.get("gameDuration", 0) < 15 * 60:  # skip remakes / early FF
+        db.commit()
         return 0
     parts = info["participants"]
     if all_players:
@@ -193,6 +198,7 @@ class Crawler:
                                 if p["championName"] in focus:
                                     db.execute("INSERT OR REPLACE INTO focus_players VALUES (?,?,?,?,?)",
                                                (p["puuid"], region, tier, p["championName"], int(time.time())))
+                                    db.commit()  # never hold the write lock during API calls
                                     if p["puuid"] not in done:
                                         queue.insert(0, (p["puuid"], tier, True))
                     st["message"] = f"{st['matches']}/{target} Games gesammelt"
