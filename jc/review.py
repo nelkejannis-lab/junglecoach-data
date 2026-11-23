@@ -35,7 +35,10 @@ class RiotAPI:
         if params:
             url += "?" + urllib.parse.urlencode(params)
         for _ in range(4):
-            req = urllib.request.Request(url, headers={"X-Riot-Token": self.key})
+            req = urllib.request.Request(url, headers={
+                "X-Riot-Token": self.key, "Accept": "application/json",
+                "Accept-Language": "de-DE,de;q=0.9,en;q=0.8", "Accept-Charset": "application/x-www-form-urlencoded; charset=UTF-8",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) JungleCoach/0.7 (+https://github.com/nelkejannis-lab/junglecoach)"})
             try:
                 with urllib.request.urlopen(req, timeout=15) as r:
                     return json.loads(r.read().decode("utf-8"))
@@ -43,10 +46,12 @@ class RiotAPI:
                 if e.code == 429:  # rate limit: wait as told
                     time.sleep(int(e.headers.get("Retry-After", "5")) + 1)
                     continue
+                raw = b""
                 try:
-                    detail = json.loads(e.read().decode("utf-8")).get("status", {}).get("message", "")
+                    raw = e.read()
+                    detail = json.loads(raw.decode("utf-8")).get("status", {}).get("message", "")
                 except Exception:
-                    detail = ""
+                    detail = raw.decode("utf-8", "replace").strip()[:120]
                 where = path.split("?")[0]
                 if e.code in (401, 403):
                     raise RiotKeyError(f"Riot lehnt den API Key ab ({e.code}{': ' + detail if detail else ''}). "
