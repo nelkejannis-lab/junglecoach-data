@@ -32,26 +32,71 @@ def bracket_of(tier):
     return next((b for b, ts in BRACKETS.items() if tier in ts), None)
 
 
+class _Rows(list):
+    """Materialised query result (works like a cursor for fetchone / fetchall / iteration)."""
+    rowcount = 0
+
+    def fetchall(self):
+        return list(self)
+
+    def fetchone(self):
+        return self[0] if self else None
+
+
+class SafeDB:
+    """One SQLite connection shared by the poll loop, HTTP threads and background simulations:
+    every statement runs under a lock and returns its rows directly, so threads never interleave."""
+
+    def __init__(self, conn):
+        self._c = conn
+        self._lock = threading.RLock()
+
+    def execute(self, sql, args=()):
+        with self._lock:
+            cur = self._c.execute(sql, args)
+            rows = _Rows(cur.fetchall()) if cur.description else _Rows()
+            rows.rowcount = cur.rowcount
+            return rows
+
+    def executemany(self, sql, seq):
+        with self._lock:
+            return self._c.executemany(sql, seq)
+
+    def commit(self):
+        with self._lock:
+            self._c.commit()
+
+    def close(self):
+        with self._lock:
+            self._c.close()
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+
 def connect(path=None):
-    db = sqlite3.connect(path or DB_PATH, check_same_thread=False, timeout=60)
+    db = SafeDB(sqlite3.connect(path or DB_PATH, check_same_thread=False, timeout=60))
     try:  # WAL: several crawler threads can write while others read
         db.execute("PRAGMA journal_mode=WAL")
     except sqlite3.OperationalError:
         pass
     schema = """CREATE TABLE IF NOT EXISTS {t}(match_id TEXT, champ TEXT, team INT, win INT,
                   items TEXT, keystone INT, enemy TEXT, patch TEXT, created INT, tier TEXT, perks TEXT, enemies TEXT,
-                  role TEXT, PRIMARY KEY(match_id, champ))"""
+                  role TEXT, stats TEXT, PRIMARY KEY(match_id, champ))"""
     db.execute(schema.format(t="games"))
     db.execute("CREATE TABLE IF NOT EXISTS seen(match_id TEXT PRIMARY KEY)")
     # players found on a focus champion (e.g. Gwen / Graves mains): every crawl starts with them
     db.execute("""CREATE TABLE IF NOT EXISTS focus_players(puuid TEXT, region TEXT, tier TEXT, champ TEXT,
                   last_seen INT, PRIMARY KEY(puuid, region))""")
     cols = [r[1] for r in db.execute("PRAGMA table_info(games)")]
+    if cols and "stats" not in cols and "role" in cols:
+        db.execute("ALTER TABLE games ADD COLUMN stats TEXT")
+        cols.append("stats")
     pk = [r[1] for r in sorted(db.execute("PRAGMA table_info(games)"), key=lambda r: r[5]) if r[5]]
     if pk != ["match_id", "champ"] or "role" not in cols:  # migrate older databases
         db.execute(schema.format(t="games_new"))
         keep = [c for c in cols if c in ("match_id", "champ", "team", "win", "items", "keystone", "enemy", "patch",
-                                         "created", "tier", "perks", "enemies", "role")]
+                                         "created", "tier", "perks", "enemies", "role", "stats")]
         db.execute(f"INSERT OR IGNORE INTO games_new ({','.join(keep)}) SELECT {','.join(keep)} FROM games")
         if "role" not in cols:
             db.execute("UPDATE games_new SET role='JUNGLE' WHERE role IS NULL")
@@ -75,6 +120,43 @@ def _page(p):
             + [sp.get("offense", 5008), sp.get("flex", 5008), sp.get("defense", 5011)]}
     except (KeyError, IndexError):
         return 0, None
+
+
+# Detail values per player for benchmarks ("how good is this compared to Gwen players in my elo").
+# key -> (label, higher_is_better, unit)
+METRICS = {
+    "jcs10": ("Jungle-CS vor 10 Min", True, ""), "cs10": ("Lane-CS vor 10 Min", True, ""),
+    "kp": ("Kill-Beteiligung", True, "%"), "vpm": ("Vision pro Minute", True, ""),
+    "cw": ("Control Wards", True, ""), "dpm": ("Schaden pro Minute", True, ""),
+    "gpm": ("Gold pro Minute", True, ""), "deaths": ("Tode", False, ""),
+    "early_kills": ("Frühe Kills auf Lanern", True, ""), "scuttles": ("Scuttle-Krabben", True, ""),
+    "enemy_jungle": ("Gegnerische Camps gefarmt", True, ""), "drag": ("Drachen-Beteiligung", True, ""),
+    "dmg_share": ("Schadensanteil im Team", True, "%"), "solo_kills": ("Solo-Kills", True, ""),
+    "dead_share": ("Zeit tot", False, "%"), "cc": ("CC-Zeit auf Gegnern (s)", True, ""),
+}
+
+
+def metrics_of(p, duration_s):
+    """Comparable detail values of one participant (Riot match-v5 incl. 'challenges')."""
+    ch = p.get("challenges") or {}
+    mins = max(duration_s / 60, 1)
+    v = {
+        "jcs10": ch.get("jungleCsBefore10Minutes"), "cs10": ch.get("laneMinionsFirst10Minutes"),
+        "kp": round(100 * ch["killParticipation"], 1) if ch.get("killParticipation") is not None else None,
+        "vpm": round(ch["visionScorePerMinute"], 2) if ch.get("visionScorePerMinute") is not None
+        else round(p.get("visionScore", 0) / mins, 2),
+        "cw": ch.get("controlWardsPlaced", p.get("detectorWardsPlaced")),
+        "dpm": round(ch["damagePerMinute"]) if ch.get("damagePerMinute") is not None
+        else round(p.get("totalDamageDealtToChampions", 0) / mins),
+        "gpm": round(ch["goldPerMinute"]) if ch.get("goldPerMinute") is not None else round(p.get("goldEarned", 0) / mins),
+        "deaths": p.get("deaths"), "early_kills": ch.get("killsOnLanersEarlyJungleAsJungler"),
+        "scuttles": ch.get("scuttleCrabKills"), "enemy_jungle": ch.get("enemyJungleMonsterKills"),
+        "drag": ch.get("dragonTakedowns"), "solo_kills": ch.get("soloKills"),
+        "dmg_share": round(100 * ch["teamDamagePercentage"], 1) if ch.get("teamDamagePercentage") is not None else None,
+        "dead_share": round(100 * p.get("totalTimeSpentDead", 0) / max(duration_s, 1), 1),
+        "cc": p.get("timeCCingOthers"),
+    }
+    return {k: (round(x, 2) if isinstance(x, float) else x) for k, x in v.items() if x is not None}
 
 
 def store_match(db, match, tier=None, focus=None, all_players=True):
@@ -102,10 +184,11 @@ def store_match(db, match, tier=None, focus=None, all_players=True):
         ks, page = _page(p)
         enemies = [o["championName"] for o in parts if o["teamId"] != p["teamId"]]
         db.execute("INSERT OR REPLACE INTO games (match_id, champ, team, win, items, keystone, enemy, patch, created, "
-                   "tier, perks, enemies, role) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   "tier, perks, enemies, role, stats) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                    (mid, p["championName"], p["teamId"], int(bool(p.get("win"))), json.dumps(items), ks,
                     opp["championName"] if opp else "", patch, info.get("gameCreation", 0), tier,
-                    json.dumps(page) if page else None, json.dumps(enemies), role))
+                    json.dumps(page) if page else None, json.dumps(enemies), role,
+                    json.dumps(metrics_of(p, info.get("gameDuration", 0)))))
     db.commit()
     return len(chosen)
 
@@ -241,6 +324,22 @@ def merge_from(db, other_path):
 
 
 # ---------------------------------------------------------------- stats
+def percentile(sorted_vals, x):
+    """Share of values below x (ties count half), 0-100."""
+    import bisect
+    if not sorted_vals:
+        return None
+    lo = bisect.bisect_left(sorted_vals, x)
+    hi = bisect.bisect_right(sorted_vals, x)
+    return round(100 * (lo + (hi - lo) / 2) / len(sorted_vals))
+
+
+def quantile(sorted_vals, q):
+    if not sorted_vals:
+        return None
+    return sorted_vals[min(len(sorted_vals) - 1, int(q * len(sorted_vals)))]
+
+
 def _beta_prob_better(w1, n1, w2, n2, draws=4000, seed=7):
     """Monte-Carlo: P(p1 > p2) with Beta(1+w, 1+l) posteriors, plus mean uplift."""
     rng = random.Random(seed)
@@ -519,6 +618,33 @@ class MetaStats:
                 "hidden_items": hidden_items[:3], "hidden_keystones": hidden_keys[:2],
                 "worst_matchups": matchups[:5], "best_matchups": matchups[::-1][:5]}
 
+    def role_total(self, role):
+        r = self.db.execute("SELECT COUNT(*) FROM games WHERE role=? AND patch=?", (role, self.current_patch())).fetchone()
+        return r[0] if r else 0
+
+    def benchmarks(self, champ, role="JUNGLE", bracket=None, min_games=30):
+        """Distribution of every detail value for this champion + role (+ elo), widening the scope
+        (elo -> all elos -> role over all champions) until there is enough data."""
+        tiers = BRACKETS.get(bracket) if bracket else None
+        tries = []
+        if tiers:
+            tries.append(("champ=? AND role=? AND tier IN (%s)" % ",".join("?" * len(tiers)), [champ, role, *tiers],
+                          f"{champ} {role.title()} in deinem Elo"))
+        tries.append(("champ=? AND role=?", [champ, role], f"{champ} {role.title()}, alle Elos"))
+        if tiers:
+            tries.append(("role=? AND tier IN (%s)" % ",".join("?" * len(tiers)), [role, *tiers],
+                          f"alle {role.title()}-Spieler in deinem Elo"))
+        tries.append(("role=?", [role], f"alle {role.title()}-Spieler"))
+        for where, args, label in tries:
+            rows = self.db.execute(f"SELECT stats, win FROM games WHERE stats IS NOT NULL AND {where}", args).fetchall()
+            if len(rows) >= min_games:
+                dist = {}
+                for st, _ in rows:
+                    for k, v in json.loads(st).items():
+                        dist.setdefault(k, []).append(v)
+                return {"scope": label, "games": len(rows), "dist": {k: sorted(v) for k, v in dist.items() if len(v) >= min_games}}
+        return None
+
     def tierlist(self, min_games=30, bracket=None, role="JUNGLE"):
         patch = self.current_patch()
         tiers = BRACKETS.get(bracket) or ALL_TIERS
@@ -526,7 +652,14 @@ class MetaStats:
             f"SELECT champ, SUM(win), COUNT(*) FROM games WHERE patch=? AND role=? AND (tier IN ({','.join('?' * len(tiers))})"
             f"{' OR tier IS NULL' if not bracket else ''}) GROUP BY champ", (patch, role, *tiers)).fetchall()
         total = sum(r[2] for r in rows) or 1
+        matches = max(total / 2, 1)  # two players per role and match
         out = [{"champion": c, "games": n, "winrate": round(100 * w / n, 1),
-                "adj_winrate": round(100 * _shrunk(w, n, 0.5), 1), "pickrate": round(100 * n / total, 1)}
+                "adj_winrate": round(100 * _shrunk(w, n, 0.5), 1), "pickrate": round(100 * n / matches, 1)}
                for c, w, n in rows if n >= min_games]
-        return sorted(out, key=lambda x: -x["adj_winrate"])
+        conf = {c: round(100 * _shrunk(w, n, 0.5, k=60), 2) for c, w, n in rows}  # tiers need more evidence
+        out.sort(key=lambda x: -(conf[x["champion"]] + min(x["pickrate"], 20) * 0.05))
+        for i, t in enumerate(out):  # op.gg-like tiers by rank
+            q = i / max(len(out), 1)
+            t["tier"] = "S" if q < 0.1 else "A" if q < 0.3 else "B" if q < 0.6 else "C" if q < 0.85 else "D"
+            t["rank"] = i + 1
+        return out
