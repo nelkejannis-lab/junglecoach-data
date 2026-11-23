@@ -47,6 +47,7 @@ def main():
         "cdragon/champion-summary.json": f"{CD}/plugins/rcp-be-lol-game-data/global/default/v1/champion-summary.json",
         "cdragon/items.json": f"{CD}/plugins/rcp-be-lol-game-data/global/default/v1/items.json",
         "cdragon/items.cdtb.bin.json": f"{CD}/game/items.cdtb.bin.json",
+        "cdragon/lol.stringtable.json": f"{CD}/game/en_us/data/menu/en_us/lol.stringtable.json",
     }
     for m in MONSTERS:
         jobs[f"cdragon/monsters/{m}.bin.json"] = f"{CD}/game/data/characters/{m}/{m}.bin.json"
