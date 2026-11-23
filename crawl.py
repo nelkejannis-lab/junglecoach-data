@@ -16,6 +16,8 @@ ap.add_argument("--regions", default="euw1,na1,kr")
 a = ap.parse_args()
 
 key = os.environ["RIOT_API_KEY"].strip()
+# champions to collect (all roles); empty = all junglers
+FOCUS = [c.strip() for c in os.environ.get("FOCUS", "Gwen,Graves").split(",") if c.strip()]
 deadline = time.time() + a.minutes * 60
 db = meta.connect(a.db)
 before = db.execute("SELECT COUNT(*) FROM games").fetchone()[0]
@@ -25,7 +27,7 @@ db.close()
 def run(region):
     while time.time() < deadline - 60:  # new player sample per round
         cfg = {"riot_api_key": key, "platform": region, "meta_max_matches": 10 ** 9,
-               "meta_players_per_tier": 60, "meta_matches_per_player": 5}
+               "meta_players_per_tier": 60, "meta_matches_per_player": 10, "meta_focus": FOCUS}
         cr = meta.Crawler(cfg, db_path=a.db, deadline=deadline)
         cr._run()
         print(f"[{region}] {cr.state['message']}", flush=True)

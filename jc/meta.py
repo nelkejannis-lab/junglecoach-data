@@ -34,14 +34,23 @@ def bracket_of(tier):
 
 def connect(path=None):
     db = sqlite3.connect(path or DB_PATH, check_same_thread=False, timeout=30)
-    db.execute("""CREATE TABLE IF NOT EXISTS games(match_id TEXT, champ TEXT, team INT, win INT,
+    schema = """CREATE TABLE IF NOT EXISTS {t}(match_id TEXT, champ TEXT, team INT, win INT,
                   items TEXT, keystone INT, enemy TEXT, patch TEXT, created INT, tier TEXT, perks TEXT, enemies TEXT,
-                  PRIMARY KEY(match_id, team))""")
+                  role TEXT, PRIMARY KEY(match_id, champ))"""
+    db.execute(schema.format(t="games"))
     db.execute("CREATE TABLE IF NOT EXISTS seen(match_id TEXT PRIMARY KEY)")
-    cols = {r[1] for r in db.execute("PRAGMA table_info(games)")}
-    for col in ("tier", "perks", "enemies"):  # migrate DBs from older versions
-        if col not in cols:
-            db.execute(f"ALTER TABLE games ADD COLUMN {col} TEXT")
+    cols = [r[1] for r in db.execute("PRAGMA table_info(games)")]
+    pk = [r[1] for r in sorted(db.execute("PRAGMA table_info(games)"), key=lambda r: r[5]) if r[5]]
+    if pk != ["match_id", "champ"] or "role" not in cols:  # migrate older databases
+        db.execute(schema.format(t="games_new"))
+        keep = [c for c in cols if c in ("match_id", "champ", "team", "win", "items", "keystone", "enemy", "patch",
+                                         "created", "tier", "perks", "enemies", "role")]
+        db.execute(f"INSERT OR IGNORE INTO games_new ({','.join(keep)}) SELECT {','.join(keep)} FROM games")
+        if "role" not in cols:
+            db.execute("UPDATE games_new SET role='JUNGLE' WHERE role IS NULL")
+        db.execute("DROP TABLE games")
+        db.execute("ALTER TABLE games_new RENAME TO games")
+        db.commit()
     return db
 
 
@@ -49,34 +58,48 @@ def patch_of(version):
     return ".".join(str(version).split(".")[:2])
 
 
-def store_match(db, match, tier=None):
-    """Stores both junglers of a ranked match. Returns number of rows written."""
+def _page(p):
+    try:
+        st = p["perks"]["styles"]
+        sp = p["perks"].get("statPerks", {})
+        return st[0]["selections"][0]["perk"], {
+            "primary": st[0]["style"], "sub": st[1]["style"],
+            "perks": [x["perk"] for x in st[0]["selections"]] + [x["perk"] for x in st[1]["selections"]]
+            + [sp.get("offense", 5008), sp.get("flex", 5008), sp.get("defense", 5011)]}
+    except (KeyError, IndexError):
+        return 0, None
+
+
+def store_match(db, match, tier=None, focus=None, all_players=True):
+    """Stores all 10 players of a ranked match (champion, role, items, runes, lane opponent),
+    so statistics exist for every champion and role. focus only steers the crawler (snowball).
+    all_players=False keeps the old behaviour (only the two junglers)."""
     info = match["info"]
     mid = match["metadata"]["matchId"]
     db.execute("INSERT OR IGNORE INTO seen VALUES (?)", (mid,))
-    jgs = [p for p in info["participants"] if p.get("teamPosition") == "JUNGLE"]
-    if len(jgs) != 2 or info.get("gameDuration", 0) < 15 * 60:  # skip remakes / early FF
+    if info.get("gameDuration", 0) < 15 * 60:  # skip remakes / early FF
         return 0
+    parts = info["participants"]
+    if all_players:
+        chosen = parts
+    else:
+        chosen = [p for p in parts if p.get("teamPosition") == "JUNGLE"]
+        if len(chosen) != 2:
+            return 0
     patch = patch_of(info.get("gameVersion", ""))
-    for p in jgs:
-        other = next(o for o in jgs if o is not p)
+    for p in chosen:
+        role = p.get("teamPosition") or ""
+        opp = next((o for o in parts if o["teamId"] != p["teamId"] and o.get("teamPosition") == role and role), None)
         items = [p.get(f"item{i}", 0) for i in range(7) if p.get(f"item{i}", 0)]
-        try:
-            st = p["perks"]["styles"]
-            ks = st[0]["selections"][0]["perk"]
-            sp = p["perks"].get("statPerks", {})
-            page = {"primary": st[0]["style"], "sub": st[1]["style"],
-                    "perks": [x["perk"] for x in st[0]["selections"]] + [x["perk"] for x in st[1]["selections"]]
-                    + [sp.get("offense", 5008), sp.get("flex", 5008), sp.get("defense", 5011)]}
-        except (KeyError, IndexError):
-            ks, page = 0, None
-        enemies = [o["championName"] for o in info["participants"] if o["teamId"] != p["teamId"]]
-        db.execute("INSERT OR REPLACE INTO games VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                   (mid, p["championName"], p["teamId"], int(p["win"]), json.dumps(items), ks,
-                    other["championName"], patch, info.get("gameCreation", 0), tier,
-                    json.dumps(page) if page else None, json.dumps(enemies)))
+        ks, page = _page(p)
+        enemies = [o["championName"] for o in parts if o["teamId"] != p["teamId"]]
+        db.execute("INSERT OR REPLACE INTO games (match_id, champ, team, win, items, keystone, enemy, patch, created, "
+                   "tier, perks, enemies, role) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (mid, p["championName"], p["teamId"], int(bool(p.get("win"))), json.dumps(items), ks,
+                    opp["championName"] if opp else "", patch, info.get("gameCreation", 0), tier,
+                    json.dumps(page) if page else None, json.dumps(enemies), role))
     db.commit()
-    return 2
+    return len(chosen)
 
 
 # ---------------------------------------------------------------- crawler
@@ -129,7 +152,14 @@ class Crawler:
             players = self._players(api)
             target = int(self.cfg.get("meta_max_matches", 1500))
             seen = {r[0] for r in db.execute("SELECT match_id FROM seen")}
-            for puuid, tier in players:
+            focus = set(self.cfg.get("meta_focus") or self.cfg.get("champion_pool") or [])
+            queue = list(players)
+            done = set()
+            while queue:
+                puuid, tier = queue.pop(0)
+                if puuid in done:
+                    continue
+                done.add(puuid)
                 if self.deadline and time.time() > self.deadline:
                     break
                 if self._stop or st["matches"] >= target:
@@ -143,8 +173,13 @@ class Crawler:
                     if mid in seen:
                         continue
                     seen.add(mid)
-                    if store_match(db, api.get(f"/lol/match/v5/matches/{mid}"), tier):
+                    m = api.get(f"/lol/match/v5/matches/{mid}")
+                    if store_match(db, m, tier, focus or None):
                         st["matches"] += 1
+                        if focus and any(p["championName"] in focus for p in m["info"]["participants"]):  # snowball: players on a focus champion probably play it again
+                            for p in m["info"]["participants"]:
+                                if p["championName"] in focus and p["puuid"] not in done:
+                                    queue.insert(0, (p["puuid"], tier))
                     st["message"] = f"{st['matches']}/{target} Games gesammelt"
             st["message"] = f"fertig – {st['matches']} neue Games"
         except Exception as e:
@@ -154,7 +189,7 @@ class Crawler:
             db.close()
 
 
-def prune(db, keep_patches=2, max_rows=400_000):
+def prune(db, keep_patches=2, max_rows=1_000_000):
     """Keep the database small: only the newest patches and at most max_rows games."""
     patches = [r[0] for r in db.execute("SELECT patch FROM games GROUP BY patch ORDER BY MAX(created) DESC")]
     for old in patches[keep_patches:]:
@@ -197,6 +232,7 @@ def _shrunk(w, n, base, k=20):
 
 class MetaStats:
     def __init__(self, gd, db=None):
+        self.role = None
         self.gd = gd
         self.db = db or connect()
 
@@ -212,12 +248,29 @@ class MetaStats:
         q = "SELECT COUNT(*) FROM games" + (" WHERE patch=?" if patch else "")
         return self.db.execute(q, (patch,) if patch else ()).fetchone()[0]
 
-    def _rows(self, champ, bracket=None, min_games=60):
+    def main_role(self, champ):
+        r = self.db.execute("SELECT role, COUNT(*) c FROM games WHERE champ=? GROUP BY role ORDER BY c DESC LIMIT 1",
+                            (champ,)).fetchone()
+        return r[0] if r else None
+
+    def _rows(self, champ, bracket=None, min_games=60, role=None):
         """Widens the scope step by step until there is enough data:
-        patch+elo bracket -> patch (all elos) -> all patches+bracket -> everything."""
+        patch+elo bracket -> patch (all elos) -> all patches+bracket -> everything.
+        With a role (e.g. Gwen TOP vs Gwen JUNGLE) only games in that role count."""
+        role = role or getattr(self, "role", None)
+        if role:
+            self.role = None
+            try:
+                rows, scope = self._rows(champ, bracket, min_games)
+            finally:
+                self.role = role
+            rrows = [r for r in rows if r[6] == role]
+            if len(rrows) >= min(30, min_games):
+                return rrows, scope + f", Rolle {role.title()}"
+            return rows, scope
         patch = self.current_patch()
         tiers = BRACKETS.get(bracket) if bracket else None
-        cols = "win, items, keystone, enemy, perks, enemies"
+        cols = "win, items, keystone, enemy, perks, enemies, role"
         tq = f" AND tier IN ({','.join('?' * len(tiers))})" if tiers else ""
         attempts = []
         if tiers:
@@ -232,8 +285,8 @@ class MetaStats:
             scope = label
             if len(rows) >= min_games:
                 break
-        return [(w, json.loads(i), k, e, json.loads(pk) if pk else None, set(json.loads(en)) if en else {e})
-                for w, i, k, e, pk, en in rows], scope
+        return [(w, json.loads(i), k, e, json.loads(pk) if pk else None, set(json.loads(en)) if en else {e}, ro)
+                for w, i, k, e, pk, en, ro in rows], scope
 
     @staticmethod
     def best_page(rows, keystone):
@@ -424,7 +477,7 @@ class MetaStats:
         hidden_keys = gems(keystones, {keystones[0]["id"]} if keystones else set(), lambda r, k: r[2] == k)
 
         mu = {}
-        for w, _, _, e, _, _ in rows:
+        for w, _, _, e, _, _, _ in rows:
             m = mu.setdefault(e, [0, 0])
             m[0] += w; m[1] += 1
         matchups = [{"enemy": e, "games": c, "winrate": round(100 * w / c, 1),
@@ -439,14 +492,14 @@ class MetaStats:
                 "hidden_items": hidden_items[:3], "hidden_keystones": hidden_keys[:2],
                 "worst_matchups": matchups[:5], "best_matchups": matchups[::-1][:5]}
 
-    def tierlist(self, min_games=30, bracket=None):
+    def tierlist(self, min_games=30, bracket=None, role="JUNGLE"):
         patch = self.current_patch()
         tiers = BRACKETS.get(bracket) or ALL_TIERS
         rows = self.db.execute(
-            f"SELECT champ, SUM(win), COUNT(*) FROM games WHERE patch=? AND (tier IN ({','.join('?' * len(tiers))})"
-            f"{' OR tier IS NULL' if not bracket else ''}) GROUP BY champ", (patch, *tiers)).fetchall()
+            f"SELECT champ, SUM(win), COUNT(*) FROM games WHERE patch=? AND role=? AND (tier IN ({','.join('?' * len(tiers))})"
+            f"{' OR tier IS NULL' if not bracket else ''}) GROUP BY champ", (patch, role, *tiers)).fetchall()
         total = sum(r[2] for r in rows) or 1
         out = [{"champion": c, "games": n, "winrate": round(100 * w / n, 1),
-                "adj_winrate": round(100 * _shrunk(w, n, 0.5), 1), "pickrate": round(200 * n / total, 1)}
+                "adj_winrate": round(100 * _shrunk(w, n, 0.5), 1), "pickrate": round(100 * n / total, 1)}
                for c, w, n in rows if n >= min_games]
         return sorted(out, key=lambda x: -x["adj_winrate"])
