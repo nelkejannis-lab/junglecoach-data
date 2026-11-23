@@ -35,7 +35,8 @@ def run(region):
     while time.time() < deadline - 60:  # new player sample per round
         cfg = {"riot_api_key": key, "platform": region, "meta_max_matches": 10 ** 9,
                "meta_players_per_tier": 60, "meta_matches_per_player": 10, "meta_focus": FOCUS,
-               "meta_focus_matches": 25, "meta_focus_players": 400}
+               "meta_focus_matches": 25, "meta_focus_players": 400,
+               "meta_timelines": True}  # exact purchase order (1 extra request per match -> ~half the games)
         cr = meta.Crawler(cfg, db_path=a.db, deadline=deadline)
         cr._run()
         print(f"[{region}] {cr.state['message']}", flush=True)
