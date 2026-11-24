@@ -206,6 +206,13 @@ def store_match(db, match, tier=None, focus=None, all_players=True, timeline=Non
             return 0
     patch = patch_of(info.get("gameVersion", ""))
     bought = purchases(timeline) if timeline else {}
+    dcause = {}
+    if timeline:
+        try:
+            from .deep import death_causes_all
+            dcause = death_causes_all(match, timeline)
+        except Exception:  # noqa: BLE001 - analysis is optional
+            dcause = {}
     for p in chosen:
         role = p.get("teamPosition") or ""
         opp = next((o for o in parts if o["teamId"] != p["teamId"] and o.get("teamPosition") == role and role), None)
@@ -218,7 +225,9 @@ def store_match(db, match, tier=None, focus=None, all_players=True, timeline=Non
                    (mid, p["championName"], p["teamId"], int(bool(p.get("win"))), json.dumps(items), ks,
                     opp["championName"] if opp else "", patch, info.get("gameCreation", 0), tier,
                     json.dumps(page) if page else None, json.dumps(enemies), role,
-                    json.dumps(metrics_of(p, info.get("gameDuration", 0))), json.dumps(b) if b else None))
+                    json.dumps({**metrics_of(p, info.get("gameDuration", 0)),
+                                **{"dc_" + c: n for c, n in dcause.get(p.get("participantId"), {}).items()}}),
+                    json.dumps(b) if b else None))
     db.commit()
     return len(chosen)
 
@@ -869,6 +878,24 @@ class MetaStats:
                     for k, v in json.loads(st).items():
                         dist.setdefault(k, []).append(v)
                 return {"scope": label, "games": len(rows), "dist": {k: sorted(v) for k, v in dist.items() if len(v) >= min_games}}
+        return None
+
+    def death_benchmark(self, role="JUNGLE", bracket=None, min_games=40):
+        """Deaths per game by cause for BETTER players: winners of the next higher elo bracket (or own bracket
+        at the top), same role. Only games crawled with timeline carry death causes."""
+        order = ["low", "mid", "high", "apex"]
+        b = bracket if bracket in order else "mid"
+        better = order[min(order.index(b) + 1, len(order) - 1)]
+        for tiers, label in ((BRACKETS[better], f"Gewinner in {better.title()}-Elo"), (ALL_TIERS, "Gewinner aller Elos")):
+            rows = self.db.execute(f"SELECT stats FROM games WHERE win=1 AND role=? AND stats LIKE '%dc_%' "
+                                   f"AND tier IN ({','.join('?' * len(tiers))})", (role, *tiers)).fetchall()
+            if len(rows) >= min_games:
+                tot = {}
+                for (st,) in rows:
+                    for k, v in json.loads(st).items():
+                        if k.startswith("dc_"):
+                            tot[k[3:]] = tot.get(k[3:], 0) + v
+                return {"scope": label, "games": len(rows), "per_game": {k: round(v / len(rows), 2) for k, v in tot.items()}}
         return None
 
     def tierlist(self, min_games=30, bracket=None, role="JUNGLE"):
