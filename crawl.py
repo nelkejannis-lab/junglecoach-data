@@ -15,14 +15,22 @@ ap.add_argument("--db", default="meta.sqlite")
 ap.add_argument("--regions", default="euw1,na1,kr,oc1")  # one per Riot routing region = 4x the rate limit
 a = ap.parse_args()
 
-key = os.environ["RIOT_API_KEY"].strip()
-# fail fast with a clear message (GitHub then e-mails the repo owner) instead of crawling nothing
-try:
-    from jc.review import RiotAPI
-    RiotAPI(key, "euw1").get_platform("/lol/status/v4/platform-data")
-except Exception as e:  # noqa: BLE001
-    raise SystemExit(f"RIOT_API_KEY abgelaufen oder ungültig ({e}). Neuen Key unter developer.riotgames.com "
-                     "holen und im Daten-Repo unter Settings > Secrets > RIOT_API_KEY eintragen.")
+from jc.review import RiotAPI
+
+# 1st choice: the key the admin set in the Moosi app (fetched by the workflow), 2nd: the repo secret
+key, err = None, None
+for cand in (os.environ.get("SERVER_RIOT_KEY", ""), os.environ.get("RIOT_API_KEY", "")):
+    cand = cand.strip()
+    if not cand:
+        continue
+    try:
+        RiotAPI(cand, "euw1").get_platform("/lol/status/v4/platform-data")
+        key = cand
+        break
+    except Exception as e:  # noqa: BLE001
+        err = e
+if not key:  # fail fast with a clear message (GitHub then e-mails the repo owner) instead of crawling nothing
+    raise SystemExit(f"Kein gültiger Riot-Key ({err}). Neuen Key in der Moosi-App unter Mehr > Admin eintragen.")
 # champions to collect (all roles); empty = all junglers
 FOCUS = [c.strip() for c in os.environ.get("FOCUS", "Gwen,Graves").split(",") if c.strip()]
 deadline = time.time() + a.minutes * 60
@@ -36,7 +44,8 @@ def run(region):
         cfg = {"riot_api_key": key, "platform": region, "meta_max_matches": 10 ** 9,
                "meta_players_per_tier": 60, "meta_matches_per_player": 10, "meta_focus": FOCUS,
                "meta_focus_matches": 25, "meta_focus_players": 400,
-               "meta_timelines": True}  # exact purchase order (1 extra request per match -> ~half the games)
+               "meta_timelines": True,
+               "meta_tiers": meta.CRAWL_TIERS, "meta_balance": True}  # Silver+ only, every elo bucket equally  # exact purchase order (1 extra request per match -> ~half the games)
         cr = meta.Crawler(cfg, db_path=a.db, deadline=deadline)
         cr._run()
         print(f"[{region}] {cr.state['message']}", flush=True)
@@ -53,7 +62,8 @@ for t in threads:
     t.join()
 
 db = meta.connect(a.db)
-meta.prune(db, keep_patches=2, max_rows=400_000)
+meta.prune_balanced(db, max_matches=100_000)
+print("Games je Elo:", meta.bucket_counts(db))
 db.execute("DELETE FROM seen WHERE match_id NOT IN (SELECT match_id FROM games)")
 db.commit()
 db.execute("VACUUM")

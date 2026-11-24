@@ -292,10 +292,17 @@ class Crawler:
             seen = {r[0] for r in db.execute("SELECT match_id FROM seen")}
             queue = known + [(p, t, False) for p, t in players]
             done = set()
+            balance = bool(self.cfg.get("meta_balance"))
+            counts = bucket_counts(db) if balance else {}
+            slack = int(self.cfg.get("meta_balance_slack", 800))
             while queue:
                 puuid, tier, is_focus = queue.pop(0)
                 if puuid in done:
                     continue
+                if balance:   # even elo spread: a bucket may only run ahead of the emptiest one by `slack` games
+                    b = bucket(tier)
+                    if not b or counts[b] > min(counts.values()) + slack:
+                        continue
                 done.add(puuid)
                 if self.deadline and time.time() > self.deadline:
                     break
@@ -321,6 +328,8 @@ class Crawler:
                             tl = None
                     if store_match(db, m, tier, focus or None, timeline=tl):
                         st["matches"] += 1
+                        if balance and bucket(tier):
+                            counts[bucket(tier)] += 1
                         if focus and any(p["championName"] in focus for p in m["info"]["participants"]):  # snowball: players on a focus champion probably play it again
                             for p in m["info"]["participants"]:
                                 if p["championName"] in focus:
@@ -337,6 +346,42 @@ class Crawler:
         finally:
             st["running"] = False
             db.close()
+
+
+CRAWL_TIERS = ["SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"]
+
+
+def bucket(tier):
+    """Elo buckets the crawler fills evenly: Silver, Gold, Plat, Emerald, Diamond, Master+ (Iron/Bronze: none)."""
+    t = (tier or "").upper()
+    if t in APEX:
+        return "MASTER+"
+    return t if t in CRAWL_TIERS else None
+
+
+def bucket_counts(db):
+    """Matches per elo bucket (a match counts for the tier of the player it was found through)."""
+    out = {b: 0 for b in ("SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND", "MASTER+")}
+    for tier, n in db.execute("SELECT tier, COUNT(DISTINCT match_id) FROM games GROUP BY tier"):
+        b = bucket(tier)
+        if b:
+            out[b] += n
+    return out
+
+
+def prune_balanced(db, max_matches=100_000, keep_patches=2, enough_current=600_000):
+    """Silver and up only, every elo bucket gets the same share (newest games win), old patches go
+    once the current one has enough rows."""
+    prune(db, keep_patches=keep_patches, max_rows=10 ** 9, enough_current=enough_current)
+    db.execute(f"DELETE FROM games WHERE tier IS NULL OR tier NOT IN ({','.join('?' * len(CRAWL_TIERS))})", CRAWL_TIERS)
+    per = max_matches // 6
+    for b, tiers in (("SILVER", ["SILVER"]), ("GOLD", ["GOLD"]), ("PLATINUM", ["PLATINUM"]), ("EMERALD", ["EMERALD"]),
+                     ("DIAMOND", ["DIAMOND"]), ("MASTER+", APEX)):
+        q = ",".join("?" * len(tiers))
+        db.execute(f"""DELETE FROM games WHERE tier IN ({q}) AND match_id IN (
+            SELECT match_id FROM games WHERE tier IN ({q}) GROUP BY match_id ORDER BY MAX(created) DESC LIMIT -1 OFFSET ?)""",
+                   (*tiers, *tiers, per))
+    db.commit()
 
 
 def prune(db, keep_patches=2, max_rows=1_000_000, enough_current=150_000):

@@ -10,6 +10,7 @@ on:
     - cron: "17 * * * *"
 permissions:
   contents: write
+  id-token: write   # proves to moosi.app that this is the crawl workflow -> gets the current Riot key from the app
 concurrency:
   group: crawl
   cancel-in-progress: false
@@ -25,6 +26,11 @@ jobs:
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
           gh release download meta-latest -p meta.sqlite.gz -R ${{ github.repository }} && gunzip -f meta.sqlite.gz || echo "first run"
+      - name: Riot key from moosi.app (the admin sets it once in the app)
+        run: |
+          OIDC=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=moosi.app" | python -c "import sys,json;print(json.load(sys.stdin)['value'])")
+          KEY=$(curl -sf -X POST -H "Authorization: Bearer $OIDC" https://moosi.app/api/crawler/key | python -c "import sys,json;print(json.load(sys.stdin).get('key',''))" || true)
+          if [ -n "$KEY" ]; then echo "::add-mask::$KEY"; echo "SERVER_RIOT_KEY=$KEY" >> "$GITHUB_ENV"; echo "Key vom Server geholt"; else echo "kein Server-Key – nutze Secret"; fi
       - name: Crawl
         env: { RIOT_API_KEY: "${{ secrets.RIOT_API_KEY }}" }
         run: python crawl.py --minutes ${{ inputs.minutes || '320' }}
