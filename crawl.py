@@ -55,7 +55,13 @@ def run(region):
             time.sleep(30)
 
 
-threads = [threading.Thread(target=run, args=(r,)) for r in a.regions.split(",")]
+regions = a.regions.split(",")
+if key == os.environ.get("SERVER_RIOT_KEY", "").strip():
+    # same key as the Moosi app: Riot's rate limit is per region, the app's players are on EUW ->
+    # leave euw1/europe completely to the app, otherwise everyone gets 429 "too many requests"
+    regions = [r for r in regions if r not in ("euw1", "eun1", "tr1", "ru", "me1")] or ["na1"]
+    print("Server-Key: crawle ohne Europa, um die App nicht auszubremsen:", regions)
+threads = [threading.Thread(target=run, args=(r,)) for r in regions]
 for t in threads:
     t.start()
 for t in threads:
