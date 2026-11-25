@@ -1,11 +1,11 @@
 # Sammelt rund um die Uhr Ranked-Games: stündlich angestoßen, die Läufe warten aufeinander
-# (concurrency), sodass immer genau einer läuft – ein Lauf dauert ~5,5 Std., dann startet sofort der nächste.
+# (concurrency), sodass immer genau einer läuft – ein Lauf dauert ~45 Min.: jede Stunde neue Daten (volle DB + kleines Delta für die App).
 # und veröffentlicht die Datenbank als Release "meta-latest" für die Jungle-Coach-App.
 name: Crawl meta
 on:
   workflow_dispatch:
     inputs:
-      minutes: { description: "Laufzeit in Minuten", default: "320" }
+      minutes: { description: "Laufzeit in Minuten", default: "45" }
   schedule:
     - cron: "17 * * * *"
 permissions:
@@ -33,10 +33,15 @@ jobs:
           if [ -n "$KEY" ]; then echo "::add-mask::$KEY"; echo "SERVER_RIOT_KEY=$KEY" >> "$GITHUB_ENV"; echo "Key vom Server geholt"; else echo "kein Server-Key – nutze Secret"; fi
       - name: Crawl
         env: { RIOT_API_KEY: "${{ secrets.RIOT_API_KEY }}" }
-        run: python crawl.py --minutes ${{ inputs.minutes || '320' }}
+        run: python crawl.py --minutes ${{ inputs.minutes || '45' }}   # short runs = a fresh update every hour
       - name: Publish
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
           gh release view meta-latest -R ${{ github.repository }} >/dev/null 2>&1 || \
             gh release create meta-latest -R ${{ github.repository }} --title "Meta-Datenbank" --notes "Wird automatisch aktualisiert."
           gh release upload meta-latest meta.sqlite.gz --clobber -R ${{ github.repository }}
+          D=$(cat delta_name.txt 2>/dev/null || true)
+          if [ -n "$D" ]; then gh release upload meta-latest "$D" -R ${{ github.repository }}; fi
+          # keep the newest 96 hourly deltas (4 days) – older ones are covered by the full database
+          gh api repos/${{ github.repository }}/releases/tags/meta-latest --jq '[.assets[]|select(.name|startswith("delta-"))]|sort_by(.name)|reverse|.[96:]|.[].id' |
+            while read id; do gh api -X DELETE repos/${{ github.repository }}/releases/assets/$id; done

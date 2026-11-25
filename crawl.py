@@ -34,8 +34,10 @@ if not key:  # fail fast with a clear message (GitHub then e-mails the repo owne
 # champions to collect (all roles); empty = all junglers
 FOCUS = [c.strip() for c in os.environ.get("FOCUS", "Gwen,Graves").split(",") if c.strip()]
 deadline = time.time() + a.minutes * 60
+MAX_MATCHES = int(os.environ.get("MAX_MATCHES", "250000"))   # Silver+ in 6 equal elo buckets
 db = meta.connect(a.db)
 before = db.execute("SELECT COUNT(*) FROM games").fetchone()[0]
+start_rowid = db.execute("SELECT COALESCE(MAX(rowid), 0) FROM games").fetchone()[0]
 db.close()
 
 
@@ -68,7 +70,7 @@ for t in threads:
     t.join()
 
 db = meta.connect(a.db)
-meta.prune_balanced(db, max_matches=100_000)
+meta.prune_balanced(db, max_matches=MAX_MATCHES, enough_current=MAX_MATCHES * 6)
 print("Games je Elo:", meta.bucket_counts(db))
 db.execute("DELETE FROM seen WHERE match_id NOT IN (SELECT match_id FROM games)")
 db.commit()
@@ -79,3 +81,28 @@ db.close()
 with open(a.db, "rb") as src, gzip.open(a.db + ".gz", "wb", compresslevel=9) as dst:
     shutil.copyfileobj(src, dst)
 print(f"Datensätze: {before} -> {after}")
+
+# delta = only the games of this run: the app downloads these small files every hour instead of the whole db
+import sqlite3  # noqa: E402
+if os.path.exists("delta.sqlite"):
+    os.remove("delta.sqlite")
+src = sqlite3.connect(a.db)
+schema = src.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='games'").fetchone()[0]
+src.close()
+dl = sqlite3.connect("delta.sqlite")
+dl.execute(schema)
+dl.execute("ATTACH DATABASE ? AS big", (a.db,))
+dl.execute("INSERT INTO games SELECT * FROM big.games WHERE rowid > ?", (start_rowid,))
+dl.execute("CREATE TABLE seen(match_id TEXT PRIMARY KEY)")
+dl.execute("INSERT OR IGNORE INTO seen SELECT DISTINCT match_id FROM games")
+dl.commit()
+n_new = dl.execute("SELECT COUNT(*) FROM games").fetchone()[0]
+dl.execute("DETACH DATABASE big")
+dl.close()
+stamp = int(time.time())
+name = f"delta-{stamp}.sqlite.gz"
+with open("delta.sqlite", "rb") as f_in, gzip.open(name, "wb", compresslevel=9) as f_out:
+    shutil.copyfileobj(f_in, f_out)
+with open("delta_name.txt", "w") as f:
+    f.write(name if n_new else "")
+print(f"Delta: {n_new} neue Zeilen -> {name}")
