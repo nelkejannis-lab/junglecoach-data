@@ -40,8 +40,9 @@ jobs:
           gh release view meta-latest -R ${{ github.repository }} >/dev/null 2>&1 || \
             gh release create meta-latest -R ${{ github.repository }} --title "Meta-Datenbank" --notes "Wird automatisch aktualisiert."
           gh release upload meta-latest meta.sqlite.gz --clobber -R ${{ github.repository }}
-          D=$(cat delta_name.txt 2>/dev/null || true)
-          if [ -n "$D" ]; then gh release upload meta-latest "$D" -R ${{ github.repository }}; fi
-          # keep the newest 96 hourly deltas (4 days) – older ones are covered by the full database
-          gh api repos/${{ github.repository }}/releases/tags/meta-latest --jq '[.assets[]|select(.name|startswith("delta-"))]|sort_by(.name)|reverse|.[96:]|.[].id' |
+          # what the apps download: small statistics + one file per champion (instead of the whole database)
+          python export.py meta.sqlite out
+          gh release upload meta-latest out/agg.sqlite.gz out/shard-*.sqlite.gz --clobber -R ${{ github.repository }}
+          # old hourly deltas are no longer used
+          gh api repos/${{ github.repository }}/releases/tags/meta-latest --jq '.assets[]|select(.name|startswith("delta-"))|.id' |
             while read id; do gh api -X DELETE repos/${{ github.repository }}/releases/assets/$id; done
