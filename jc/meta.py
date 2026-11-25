@@ -187,7 +187,7 @@ def purchases(timeline):
     return out
 
 
-def store_match(db, match, tier=None, focus=None, all_players=True, timeline=None):
+def store_match(db, match, tier=None, focus=None, all_players=True, timeline=None, skip_puuid=None):
     """Stores all 10 players of a ranked match (champion, role, items, runes, lane opponent),
     so statistics exist for every champion and role. focus only steers the crawler (snowball).
     all_players=False keeps the old behaviour (only the two junglers)."""
@@ -199,7 +199,9 @@ def store_match(db, match, tier=None, focus=None, all_players=True, timeline=Non
         return 0
     parts = info["participants"]
     if all_players:
-        chosen = parts
+        # the player we found this match through is NOT random (ladder climbers, one-tricks win more often):
+        # leave his row out, the other 9 are an unbiased sample -> realistic win rates
+        chosen = [p for p in parts if not skip_puuid or p.get("puuid") != skip_puuid]
     else:
         chosen = [p for p in parts if p.get("teamPosition") == "JUNGLE"]
         if len(chosen) != 2:
@@ -326,7 +328,7 @@ class Crawler:
                             tl = api.get(f"/lol/match/v5/matches/{mid}/timeline")
                         except Exception:  # noqa: BLE001
                             tl = None
-                    if store_match(db, m, tier, focus or None, timeline=tl):
+                    if store_match(db, m, tier, focus or None, timeline=tl, skip_puuid=puuid):
                         st["matches"] += 1
                         if balance and bucket(tier):
                             counts[bucket(tier)] += 1
