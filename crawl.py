@@ -1,4 +1,4 @@
-"""Cloud crawler: collects ranked jungle games of all elos from several regions in parallel
+"""Cloud crawler: collects ranked games (all roles, all champions, Silver+) of all elos from several regions in parallel
 (each region has its own Riot rate limit) until the time budget is used up."""
 import argparse
 import gzip
@@ -32,7 +32,8 @@ for cand in (os.environ.get("SERVER_RIOT_KEY", ""), os.environ.get("RIOT_API_KEY
 if not key:  # fail fast with a clear message (GitHub then e-mails the repo owner) instead of crawling nothing
     raise SystemExit(f"Kein gültiger Riot-Key ({err}). Neuen Key in der Moosi-App unter Mehr > Admin eintragen.")
 # champions to collect (all roles); empty = all junglers
-FOCUS = [c.strip() for c in os.environ.get("FOCUS", "Gwen,Graves").split(",") if c.strip()]
+# no favourite champions or roles: an even, random sample of all ranked games (FOCUS env only for tests)
+FOCUS = [c.strip() for c in os.environ.get("FOCUS", "").split(",") if c.strip()]
 deadline = time.time() + a.minutes * 60
 MAX_MATCHES = int(os.environ.get("MAX_MATCHES", "250000"))   # Silver+ in 6 equal elo buckets
 db = meta.connect(a.db)
